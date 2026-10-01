@@ -6,6 +6,11 @@
 
 ![截图](docs/screenshot.png)
 
+## 下载
+
+- **直接下载可执行文件**：[WingetStore.exe（v1.0.0）](https://github.com/fangkuaitou/WingetStore/releases/latest) —— 单文件、无依赖，双击即用。
+- **源码**：克隆本仓库即可，主程序只有 `main.c` + `icon_data.c` 两个文件。
+
 ## 功能
 
 - **首页推荐**：启动即显示 29 款常用应用（浏览器、办公效率、影音直播、开发工具、社交通讯、游戏娱乐、安全工具），按分类展示，版本号后台自动刷新。
