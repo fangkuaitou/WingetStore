@@ -1,0 +1,21 @@
+# 编译产物与第三方二进制
+tools/tcc/
+
+# 临时文件
+*.log
+*.tmp
+shot.py
+_state.txt
+debug_worker.txt
+debug_search.txt
+debug_parse.txt
+icon_verify.png
+home*.png
+search*.png
+detail*.png
+title*.png
+
+# 编辑器/系统
+.vscode/
+.DS_Store
+Thumbs.db
