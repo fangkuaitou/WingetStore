@@ -52,6 +52,21 @@ typedef struct { HWND hwndFrom; UINT_PTR idFrom; UINT code; } MY_NMHDR;
 typedef struct { MY_NMHDR hdr; int iItem; int iSubItem; UINT uNewState;
                  UINT uOldState; UINT uChanged; POINT ptAction; LPARAM lParam; } MY_NMLISTVIEW;
 
+// ---- 列表颜色设置（不用自定义绘制，避免 TinyCC 结构体对齐导致崩溃）----
+#ifndef LVM_SETTEXTCOLOR
+#define LVM_SETTEXTCOLOR   (LVM_FIRST + 36)
+#endif
+#ifndef LVM_SETBKCOLOR
+#define LVM_SETBKCOLOR     (LVM_FIRST + 68)
+#endif
+
+// ---- 鼠标悬停跟踪（TinyCC 缺声明时手工补）----
+#ifndef TME_LEAVE
+#define TME_LEAVE 0x00000002
+typedef struct tagTRACKMOUSEEVENT { DWORD cbSize; DWORD dwFlags; HWND hwndTrack; DWORD dwHoverTime; } TRACKMOUSEEVENT;
+WINUSERAPI BOOL WINAPI TrackMouseEvent(TRACKMOUSEEVENT *);
+#endif
+
 #define ListView_InsertColumn(w, i, p)   (int)SendMessageW(w, LVM_INSERTCOLUMNW, (WPARAM)(i), (LPARAM)(p))
 #define ListView_InsertItem(w, p)        (int)SendMessageW(w, LVM_INSERTITEMW, 0, (LPARAM)(p))
 #define ListView_DeleteAllItems(w)       SendMessageW(w, LVM_DELETEALLITEMS, 0, 0)
@@ -145,8 +160,32 @@ static int GetWinVersion(DWORD *major, DWORD *build) {
 // ---------------- 全局 ----------------
 static HWND g_hMain, g_hSearch, g_hBtnSearch, g_hList, g_hBtnDetails, g_hBtnInstall, g_hBtnHome;
 static HWND g_hStatus, g_hGrp, g_hStName, g_hStPub, g_hStAuthor, g_hStVer, g_hStHome, g_hDesc, g_hDescLbl;
-static HFONT g_hFont;
+static HFONT g_hFont, g_hFontHead, g_hFontName;
 static int g_dpi = 96;
+
+// ---- Google Material 主题 ----
+#define COL_BG         RGB(0xF8,0xF9,0xFA)   // 灰底（Material grey 50）
+#define COL_SURFACE    RGB(0xFF,0xFF,0xFF)  // 白卡片
+#define COL_BLUE       RGB(0x1A,0x73,0xE8)  // Google Blue 600
+#define COL_BLUE_HV    RGB(0x1B,0x66,0xC9)  // 悬停
+#define COL_BLUE_PR    RGB(0x18,0x5A,0xBC)  // 按下
+#define COL_BLUE_TXT   RGB(0x19,0x67,0xD2)  // 选中行文字
+#define COL_BLUE_TINT  RGB(0xE8,0xF0,0xFE)  // 蓝色浅底（选中/悬停填充）
+#define COL_TEXT       RGB(0x20,0x21,0x24)  // 主文字（grey 900）
+#define COL_TEXT2      RGB(0x5F,0x63,0x68)  // 次文字（grey 700）
+#define COL_BORDER     RGB(0xDA,0xDC,0xE0)  // 边框（grey 300）
+#define COL_HOVER      RGB(0xF1,0xF3,0xF4)  // 中性悬停（grey 100）
+#ifndef CLR_NONE
+#define CLR_NONE       0xFFFFFFFF
+#endif
+
+static HBRUSH g_brBg, g_brWhite, g_brTint, g_brHover;
+static RECT   g_rcPill, g_rcListCard, g_rcDetailCard, g_rcDescBox;
+static int    g_headerH = 0, g_searchFocus = 0;
+
+// 按钮风格：0=蓝底实心  1=蓝描边  2=灰描边  3=纯文字
+enum { BT_PRIMARY = 0, BT_OUTLINE_BLUE = 1, BT_OUTLINE = 2, BT_TEXT = 3 };
+static LRESULT CALLBACK BtnProc(HWND, UINT, WPARAM, LPARAM);
 
 typedef struct {
     wchar_t *name, *id, *ver, *src;
@@ -190,9 +229,12 @@ static void SetDetailStatic(HWND h, const wchar_t *label, const wchar_t *val) {
     buf[1023] = 0;
     SetWindowTextW(h, buf);
 }
+static void SetDetailName(const wchar_t *val) {
+    SetWindowTextW(g_hStName, (val && val[0]) ? val : L"—");
+}
 
 static void ClearDetails(void) {
-    SetDetailStatic(g_hStName,   L"名字", L"");
+    SetDetailName(L"");
     SetDetailStatic(g_hStPub,    L"开发商", L"");
     SetDetailStatic(g_hStAuthor, L"上传者/作者", L"");
     SetDetailStatic(g_hStVer,    L"版本", L"");
@@ -500,7 +542,7 @@ static void ParseShow(int idx, const wchar_t *text) {
         return;
     }
     if (idx != g_sel) return;   // 用户已经切到别的条目了，只存数据不动界面
-    SetDetailStatic(g_hStName,   L"名字", it->name);
+    SetDetailName(it->name);
     SetDetailStatic(g_hStPub,    L"开发商", it->pub);
     SetDetailStatic(g_hStAuthor, L"上传者/作者", it->author);
     SetDetailStatic(g_hStVer,    L"版本", it->ver);
@@ -755,7 +797,7 @@ static void DoInstall(void) {
 static void LoadDetailUI(void) {
     if (g_sel < 0 || g_sel >= g_count) return;
     PKG *it = &g_items[g_sel];
-    SetDetailStatic(g_hStName,   L"名字", it->name);
+    SetDetailName(it->name);
     SetDetailStatic(g_hStPub,    L"开发商", it->pub);
     SetDetailStatic(g_hStAuthor, L"上传者/作者", it->author);
     SetDetailStatic(g_hStVer,    L"版本", it->ver);
@@ -774,33 +816,56 @@ static LRESULT CALLBACK EditProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 // ---------------- 布局 ----------------
 static void Layout(void) {
     RECT rc; GetClientRect(g_hMain, &rc);
-    int W = rc.right, H = rc.bottom, M = Scale(10);
-    int y = M, r = W - M;
-    // 搜索行：右侧按钮从右往左排（搜索 / 查看详情 / 安装 / 首页）
-    MoveWindow(g_hBtnSearch,  r - Scale(80), y, Scale(80), Scale(28), TRUE); r -= Scale(86);
-    MoveWindow(g_hBtnDetails, r - Scale(92), y, Scale(92), Scale(28), TRUE); r -= Scale(98);
-    MoveWindow(g_hBtnInstall, r - Scale(80), y, Scale(80), Scale(28), TRUE); r -= Scale(86);
-    MoveWindow(g_hBtnHome,    r - Scale(64), y, Scale(64), Scale(28), TRUE); r -= Scale(70);
-    MoveWindow(g_hSearch,     M, y + Scale(2), r - M, Scale(24), TRUE);
-    y += Scale(36);
-    // 列表
-    int lh = (H - y - Scale(24)) * 45 / 100;
-    MoveWindow(g_hList, M, y, W - M * 2, lh, TRUE);
-    y += lh + Scale(8);
-    // 详情组
-    MoveWindow(g_hGrp, M, y, W - M * 2, H - y - Scale(8) - Scale(22), TRUE);
-    int ix = M + Scale(14), iw = W - M * 2 - Scale(28);
-    int ry = y + Scale(20);
-    MoveWindow(g_hStName,   ix, ry, iw, Scale(18), TRUE); ry += Scale(21);
-    MoveWindow(g_hStPub,    ix, ry, iw, Scale(18), TRUE); ry += Scale(21);
-    MoveWindow(g_hStAuthor, ix, ry, iw, Scale(18), TRUE); ry += Scale(21);
-    MoveWindow(g_hStVer,    ix, ry, iw, Scale(18), TRUE); ry += Scale(21);
-    MoveWindow(g_hStHome,   ix, ry, iw, Scale(18), TRUE); ry += Scale(24);
-    MoveWindow(g_hDescLbl,  ix, ry, iw, Scale(16), TRUE); ry += Scale(18);
-    int bh = y + (H - y - Scale(8) - Scale(22)) - Scale(14) - ry;
-    MoveWindow(g_hDesc, ix, ry, iw, bh, TRUE);
+    int W = rc.right, H = rc.bottom, M = Scale(16);
+    if (W <= 0 || H <= 0) return;
+
+    // 顶栏（Google 应用白色 App Bar）
+    g_headerH = Scale(58);
+    int y = g_headerH + Scale(14);
+
+    // 搜索行：右侧按钮组（搜索=蓝实心 / 查看详情=灰描边 / 安装=蓝描边 / 首页=文字）
+    int rowH = Scale(38);
+    int r = W - M;
+    MoveWindow(g_hBtnSearch,  r - Scale(84), y, Scale(84), rowH, TRUE); r -= Scale(84) + Scale(8);
+    MoveWindow(g_hBtnDetails, r - Scale(96), y, Scale(96), rowH, TRUE); r -= Scale(96) + Scale(8);
+    MoveWindow(g_hBtnInstall, r - Scale(80), y, Scale(80), rowH, TRUE); r -= Scale(80) + Scale(8);
+    MoveWindow(g_hBtnHome,    r - Scale(60), y, Scale(60), rowH, TRUE); r -= Scale(60) + Scale(8);
+    // 搜索胶囊
+    g_rcPill.left = M; g_rcPill.top = y; g_rcPill.right = r; g_rcPill.bottom = y + rowH;
+    MoveWindow(g_hSearch, M + Scale(34), y + (rowH - Scale(26)) / 2,
+               r - M - Scale(44), Scale(26), TRUE);
+    y += rowH + Scale(14);
+
+    // 列表卡片
+    int listH = (H - y - Scale(28)) * 55 / 100;
+    g_rcListCard.left = M; g_rcListCard.top = y;
+    g_rcListCard.right = W - M; g_rcListCard.bottom = y + listH;
+    MoveWindow(g_hList, M + Scale(1), y + Scale(1), W - M * 2 - Scale(2), listH - Scale(2), TRUE);
+    y += listH + Scale(12);
+
+    // 详情卡片
+    g_rcDetailCard.left = M; g_rcDetailCard.top = y;
+    g_rcDetailCard.right = W - M; g_rcDetailCard.bottom = H - Scale(28);
+    int cardH = g_rcDetailCard.bottom - y;
+    int ix = M + Scale(18), iw = W - M * 2 - Scale(36);
+    MoveWindow(g_hGrp,    ix, y + Scale(10), iw, Scale(24), TRUE);
+    int ry = y + Scale(40);
+    MoveWindow(g_hStName,   ix, ry, iw, Scale(26), TRUE); ry += Scale(32);
+    MoveWindow(g_hStPub,    ix, ry, iw, Scale(20), TRUE); ry += Scale(23);
+    MoveWindow(g_hStAuthor, ix, ry, iw, Scale(20), TRUE); ry += Scale(23);
+    MoveWindow(g_hStVer,    ix, ry, iw, Scale(20), TRUE); ry += Scale(23);
+    MoveWindow(g_hStHome,   ix, ry, iw, Scale(20), TRUE); ry += Scale(26);
+    MoveWindow(g_hDescLbl,  ix, ry, iw, Scale(16), TRUE); ry += Scale(20);
+    g_rcDescBox.left = ix - Scale(6); g_rcDescBox.top = ry - Scale(4);
+    g_rcDescBox.right = ix + iw + Scale(6);
+    g_rcDescBox.bottom = g_rcDetailCard.bottom - Scale(8);
+    MoveWindow(g_hDesc, ix, ry, iw, g_rcDescBox.bottom - g_rcDescBox.top - Scale(8), TRUE);
+    if (g_rcDescBox.bottom - g_rcDescBox.top < Scale(40)) g_rcDescBox = g_rcDetailCard; // 太小时不画框
+
     // 状态栏
-    MoveWindow(g_hStatus, M, H - Scale(20) - Scale(4), W - M * 2, Scale(20), TRUE);
+    MoveWindow(g_hStatus, M, H - Scale(24), W - M * 2, Scale(20), TRUE);
+
+    InvalidateRect(g_hMain, NULL, TRUE);
 }
 
 static HWND Mk(HWND parent, const wchar_t *cls, const wchar_t *txt, DWORD st, int id,
@@ -811,26 +876,232 @@ static HWND Mk(HWND parent, const wchar_t *cls, const wchar_t *txt, DWORD st, in
     return hC;
 }
 
+// ---------------- Google 风格绘制 ----------------
+static void StyleButton(HWND btn, int style) {
+    SetPropW(btn, L"wbBtnStyle", (HANDLE)(INT_PTR)(style + 1));
+    SetPropW(btn, L"wbHover", NULL);
+    SetWindowLongPtrW(btn, GWLP_USERDATA,
+                      (LONG_PTR)SetWindowLongPtrW(btn, GWLP_WNDPROC, (LONG_PTR)BtnProc));
+}
+
+static LRESULT CALLBACK BtnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    WNDPROC old = (WNDPROC)GetWindowLongPtrW(h, GWLP_USERDATA);
+    if (m == WM_MOUSEMOVE) {
+        if (!GetPropW(h, L"wbHover")) {
+            SetPropW(h, L"wbHover", (HANDLE)(INT_PTR)1);
+            InvalidateRect(h, NULL, TRUE);
+            TRACKMOUSEEVENT t; t.cbSize = sizeof(t); t.dwFlags = TME_LEAVE;
+            t.hwndTrack = h; t.dwHoverTime = 0;
+            TrackMouseEvent(&t);
+        }
+    } else if (m == WM_MOUSELEAVE) {
+        RemovePropW(h, L"wbHover");
+        InvalidateRect(h, NULL, TRUE);
+    }
+    return CallWindowProcW(old, h, m, w, l);
+}
+
+static void DrawGoogleButton(DRAWITEMSTRUCT *dis) {
+    int style = (int)(INT_PTR)GetPropW(dis->hwndItem, L"wbBtnStyle") - 1;
+    int hover = GetPropW(dis->hwndItem, L"wbHover") ? 1 : 0;
+    int press = (dis->itemState & ODS_SELECTED) ? 1 : 0;
+    HDC dc = dis->hDC;
+    RECT rc = dis->rcItem;
+    int rad = (rc.bottom - rc.top) / 2;
+    SetBkMode(dc, TRANSPARENT);
+
+    HPEN pen = NULL, oldPen = NULL;
+    HBRUSH br = NULL, oldBr = NULL;
+    int hasBorder = 0;
+    switch (style) {
+    case BT_PRIMARY:      // 蓝底白字胶囊
+        br = CreateSolidBrush(press ? COL_BLUE_PR : hover ? COL_BLUE_HV : COL_BLUE);
+        oldBr = SelectObject(dc, br);
+        oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
+        RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, rad, rad);
+        break;
+    case BT_OUTLINE_BLUE: // 蓝描边胶囊
+        hasBorder = 1;
+        if (hover || press) { br = CreateSolidBrush(COL_BLUE_TINT); oldBr = SelectObject(dc, br); RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, rad, rad); }
+        pen = CreatePen(PS_SOLID, 1, COL_BLUE);
+        oldPen = SelectObject(dc, pen);
+        RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, rad, rad);
+        break;
+    case BT_OUTLINE:      // 灰描边胶囊
+        hasBorder = 1;
+        if (hover || press) { br = CreateSolidBrush(COL_HOVER); oldBr = SelectObject(dc, br); RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, rad, rad); }
+        pen = CreatePen(PS_SOLID, 1, COL_BORDER);
+        oldPen = SelectObject(dc, pen);
+        RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, rad, rad);
+        break;
+    default:              // 文字按钮
+        if (hover || press) { br = CreateSolidBrush(COL_BLUE_TINT); oldBr = SelectObject(dc, br); oldPen = SelectObject(dc, GetStockObject(NULL_PEN)); RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, rad, rad); }
+        break;
+    }
+
+    // 文字
+    wchar_t txt[64]; GetWindowTextW(dis->hwndItem, txt, 64);
+    COLORREF tc;
+    if (style == BT_PRIMARY)        tc = COL_SURFACE;
+    else if (style == BT_OUTLINE_BLUE || style == BT_TEXT) tc = COL_BLUE;
+    else                            tc = COL_TEXT2;
+    SetTextColor(dc, tc);
+    HFONT of = (HFONT)SelectObject(dc, g_hFont);
+    RECT tr = rc; tr.left += Scale(4); tr.right -= Scale(4);
+    DrawTextW(dc, txt, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SelectObject(dc, of);
+
+    if (oldPen) SelectObject(dc, oldPen);
+    if (oldBr) SelectObject(dc, oldBr);
+    if (pen) DeleteObject(pen);
+    if (br) DeleteObject(br);
+}
+
+static void DrawDetailRow(DRAWITEMSTRUCT *dis) {
+    HDC dc = dis->hDC;
+    RECT rc = dis->rcItem;
+    FillRect(dc, &rc, g_brWhite);
+    wchar_t buf[1024]; GetWindowTextW(dis->hwndItem, buf, 1024);
+    wchar_t *colon = wcschr(buf, L'：');
+    SetBkMode(dc, TRANSPARENT);
+    HFONT of = (HFONT)SelectObject(dc, g_hFont);
+    if (colon) {
+        *colon = 0;
+        SetTextColor(dc, COL_TEXT2);
+        RECT r1 = rc; r1.right = rc.left + Scale(300);
+        DrawTextW(dc, buf, -1, &r1, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        SetTextColor(dc, COL_TEXT);
+        RECT r2 = rc; r2.left = r1.left + Scale(84);
+        DrawTextW(dc, colon + 1, -1, &r2, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    } else {
+        SetTextColor(dc, COL_TEXT);
+        RECT r2 = rc; r2.left += Scale(84);
+        DrawTextW(dc, buf, -1, &r2, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+    SelectObject(dc, of);
+}
+
+// 画卡片：白底 + 细边框 + 圆角
+static void DrawCard(HDC dc, RECT rc, int radius) {
+    HPEN pen = CreatePen(PS_SOLID, 1, COL_BORDER);
+    HPEN op = SelectObject(dc, pen);
+    HBRUSH ob = SelectObject(dc, g_brWhite);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(dc, op); SelectObject(dc, ob);
+    DeleteObject(pen);
+}
+
+static void DrawChrome(HDC dc) {
+    RECT wrc; GetClientRect(g_hMain, &wrc);
+    int W = wrc.right;
+
+    // 1) 顶栏：白底 + Google 四色圆点 + 标题
+    RECT hdr = { 0, 0, W, g_headerH };
+    FillRect(dc, &hdr, g_brWhite);
+    int dot = Scale(9), gap = Scale(4);
+    int x = Scale(18), cy = g_headerH / 2;
+    COLORREF g4[4] = { RGB(0x42,0x85,0xF4), RGB(0xEA,0x43,0x35),
+                       RGB(0xFB,0xBC,0x04), RGB(0x34,0xA8,0x53) };
+    HPEN np = CreatePen(PS_SOLID, 1, COL_SURFACE);  // 用背景色笔，只留圆面
+    HPEN op = SelectObject(dc, np);
+    for (int i = 0; i < 4; i++) {
+        HBRUSH b = CreateSolidBrush(g4[i]);
+        HBRUSH ob = SelectObject(dc, b);
+        int dx = x + i * (dot + gap);
+        Ellipse(dc, dx, cy - dot / 2, dx + dot, cy + dot / 2 + 1);
+        SelectObject(dc, ob); DeleteObject(b);
+    }
+    SelectObject(dc, op); DeleteObject(np);
+    SetBkMode(dc, TRANSPARENT);
+    HFONT of = (HFONT)SelectObject(dc, g_hFontHead);
+    SetTextColor(dc, COL_TEXT);
+    TextOutW(dc, x + 4 * (dot + gap) + Scale(6), cy - Scale(13),
+             L"Winget 应用市场", 10);
+
+    // 2) 搜索胶囊：白底圆角全弧 + 聚焦蓝边 + 放大镜
+    if (g_rcPill.right > g_rcPill.left) {
+        HPEN pen = CreatePen(PS_SOLID, (g_searchFocus ? 2 : 1),
+                             g_searchFocus ? COL_BLUE : COL_BORDER);
+        HPEN op2 = SelectObject(dc, pen);
+        HBRUSH ob2 = SelectObject(dc, g_brWhite);
+        int pw = (g_rcPill.bottom - g_rcPill.top) / 2;
+        RoundRect(dc, g_rcPill.left, g_rcPill.top, g_rcPill.right, g_rcPill.bottom, pw, pw);
+        SelectObject(dc, op2); SelectObject(dc, ob2);
+        DeleteObject(pen);
+        // 放大镜：圆 + 手柄
+        HPEN mp = CreatePen(PS_SOLID, 2, g_searchFocus ? COL_BLUE : COL_TEXT2);
+        HPEN opm = SelectObject(dc, mp);
+        HBRUSH obm = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        int mx = g_rcPill.left + Scale(16), my = (g_rcPill.top + g_rcPill.bottom) / 2;
+        int mr = Scale(6);
+        Ellipse(dc, mx - mr, my - mr, mx + mr + 1, my + mr + 1);
+        MoveToEx(dc, mx + mr - 1, my + mr - 1, NULL);
+        LineTo(dc, mx + mr + Scale(5), my + mr + Scale(5));
+        SelectObject(dc, opm);
+        SelectObject(dc, obm);
+        DeleteObject(mp);
+    }
+
+    // 3) 列表 / 详情卡片
+    if (g_rcListCard.right > g_rcListCard.left)   DrawCard(dc, g_rcListCard, Scale(10));
+    if (g_rcDetailCard.right > g_rcDetailCard.left) DrawCard(dc, g_rcDetailCard, Scale(10));
+
+    // 4) 简介框（详情卡内浅灰圆角底）
+    if (g_rcDescBox.right > g_rcDescBox.left &&
+        g_rcDescBox.bottom - g_rcDescBox.top >= Scale(40)) {
+        HPEN pen = CreatePen(PS_SOLID, 1, COL_BORDER);
+        HPEN op3 = SelectObject(dc, pen);
+        HBRUSH ob3 = SelectObject(dc, g_brBg);
+        RoundRect(dc, g_rcDescBox.left, g_rcDescBox.top, g_rcDescBox.right, g_rcDescBox.bottom, Scale(8), Scale(8));
+        SelectObject(dc, op3); SelectObject(dc, ob3);
+        DeleteObject(pen);
+    }
+    SelectObject(dc, of);
+}
+
+
 // ---------------- 窗口过程 ----------------
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CREATE: {
         g_hMain = h;
+        { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "WM_CREATE start\n"); fclose(f); } }
         HDC dc = GetDC(h);
         g_dpi = GetDeviceCaps(dc, LOGPIXELSX);
         ReleaseDC(h, dc);
-        g_hFont = CreateFontW(-Scale(15), 0, 0, 0, FW_NORMAL, 0, 0, 0,
-                              DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
+        { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "WM_CREATE dpi ok\n"); fclose(f); } }
+        g_hFont     = CreateFontW(-Scale(14), 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                                  DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
+        g_hFontHead = CreateFontW(-Scale(19), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
+                                  DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
+        g_hFontName = CreateFontW(-Scale(17), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0,
+                                 DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Microsoft YaHei UI");
 
-        g_hSearch = Mk(h, L"EDIT", L"", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, IDC_EDIT_SEARCH, 0, 0, 0, 0);
+        g_brBg    = CreateSolidBrush(COL_BG);
+        g_brWhite = CreateSolidBrush(COL_SURFACE);
+        g_brTint  = CreateSolidBrush(COL_BLUE_TINT);
+        g_brHover = CreateSolidBrush(COL_HOVER);
+        { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "WM_CREATE brushes ok\n"); fclose(f); } }
+
+        g_hSearch = Mk(h, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, IDC_EDIT_SEARCH, 0, 0, 0, 0);
         SendMessageW(g_hSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"输入应用名，如：7zip");
-        g_hBtnSearch  = Mk(h, L"BUTTON", L"搜索",   BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_SEARCH,  0, 0, 0, 0);
-        g_hBtnHome    = Mk(h, L"BUTTON", L"首页",   BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_HOME,    0, 0, 0, 0);
-        g_hBtnDetails = Mk(h, L"BUTTON", L"查看详情", BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_DETAILS, 0, 0, 0, 0);
-        g_hBtnInstall = Mk(h, L"BUTTON", L"安装",   BS_PUSHBUTTON | WS_TABSTOP, IDC_BTN_INSTALL, 0, 0, 0, 0);
+        { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "WM_CREATE search ok\n"); fclose(f); } }
 
-        g_hList = Mk(h, WC_LISTVIEWW, L"", WS_BORDER | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL, IDC_LIST, 0, 0, 0, 0);
-        ListView_SetExtendedListViewStyle(g_hList, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        g_hBtnSearch  = Mk(h, L"BUTTON", L"搜索",   BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_SEARCH,  0, 0, 0, 0);
+        g_hBtnHome    = Mk(h, L"BUTTON", L"首页",   BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_HOME,    0, 0, 0, 0);
+        g_hBtnDetails = Mk(h, L"BUTTON", L"查看详情", BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_DETAILS, 0, 0, 0, 0);
+        g_hBtnInstall = Mk(h, L"BUTTON", L"安装",   BS_OWNERDRAW | WS_TABSTOP, IDC_BTN_INSTALL, 0, 0, 0, 0);
+        StyleButton(g_hBtnSearch,  BT_PRIMARY);
+        StyleButton(g_hBtnHome,    BT_TEXT);
+        StyleButton(g_hBtnDetails, BT_OUTLINE);
+        StyleButton(g_hBtnInstall, BT_OUTLINE_BLUE);
+        { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "WM_CREATE buttons ok\n"); fclose(f); } }
+
+        g_hList = Mk(h, WC_LISTVIEWW, L"", LVS_REPORT | LVS_SHOWSELALWAYS | LVS_SINGLESEL, IDC_LIST, 0, 0, 0, 0);
+        ListView_SetExtendedListViewStyle(g_hList, LVS_EX_FULLROWSELECT);
+        SendMessageW(g_hList, LVM_SETBKCOLOR, 0, (LPARAM)COL_SURFACE);
+        SendMessageW(g_hList, LVM_SETTEXTCOLOR, 0, (LPARAM)COL_TEXT);
+        { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "WM_CREATE list ok\n"); fclose(f); } }
 
         MY_LVCOLUMNW col;
         ZeroMemory(&col, sizeof(col));
@@ -839,25 +1110,29 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         col.pszText = (wchar_t *)L"ID";     col.cx = Scale(230); ListView_InsertColumn(g_hList, 1, &col);
         col.pszText = (wchar_t *)L"版本";   col.cx = Scale(120); ListView_InsertColumn(g_hList, 2, &col);
         col.pszText = (wchar_t *)L"来源";   col.cx = Scale(90);  ListView_InsertColumn(g_hList, 3, &col);
+        { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "WM_CREATE columns ok\n"); fclose(f); } }
 
-        g_hGrp      = Mk(h, L"BUTTON", L"应用详情", BS_GROUPBOX, IDC_GRP_DETAIL, 0, 0, 0, 0);
-        g_hStName   = Mk(h, L"STATIC", L"", 0, 0, 0, 0, 0, 0);
-        g_hStPub    = Mk(h, L"STATIC", L"", 0, 0, 0, 0, 0, 0);
-        g_hStAuthor = Mk(h, L"STATIC", L"", 0, 0, 0, 0, 0, 0);
-        g_hStVer    = Mk(h, L"STATIC", L"", 0, 0, 0, 0, 0, 0);
-        g_hStHome   = Mk(h, L"STATIC", L"", 0, 0, 0, 0, 0, 0);
-        g_hDescLbl  = Mk(h, L"STATIC", L"简介：", 0, 0, 0, 0, 0, 0);
+        g_hGrp      = Mk(h, L"STATIC", L"应用详情", 0, IDC_GRP_DETAIL, 0, 0, 0, 0);
+        SendMessageW(g_hGrp, WM_SETFONT, (WPARAM)g_hFontName, TRUE);
+        g_hStName   = Mk(h, L"STATIC", L"—", 0, IDC_ST_NAME, 0, 0, 0, 0);
+        SendMessageW(g_hStName, WM_SETFONT, (WPARAM)g_hFontName, TRUE);
+        g_hStPub    = Mk(h, L"STATIC", L"", SS_OWNERDRAW, IDC_ST_PUB, 0, 0, 0, 0);
+        g_hStAuthor = Mk(h, L"STATIC", L"", SS_OWNERDRAW, IDC_ST_AUTHOR, 0, 0, 0, 0);
+        g_hStVer    = Mk(h, L"STATIC", L"", SS_OWNERDRAW, IDC_ST_VER, 0, 0, 0, 0);
+        g_hStHome   = Mk(h, L"STATIC", L"", SS_OWNERDRAW, IDC_ST_HOME, 0, 0, 0, 0);
+        g_hDescLbl  = Mk(h, L"STATIC", L"简介", 0, IDC_ST_DESC_LBL, 0, 0, 0, 0);
         g_hDesc     = Mk(h, L"EDIT", L"（双击列表条目加载详情）",
-                         WS_BORDER | WS_VSCROLL | ES_READONLY | ES_MULTILINE | ES_AUTOVSCROLL,
+                         WS_VSCROLL | ES_READONLY | ES_MULTILINE | ES_AUTOVSCROLL,
                          IDC_EDIT_DESC, 0, 0, 0, 0);
-        SendMessageW(g_hDesc, EM_SETBKCOLOR, 0, (LPARAM)GetSysColor(COLOR_WINDOW)); // 明亮背景
+        { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "WM_CREATE details ok\n"); fclose(f); } }
 
-        g_hStatus = Mk(h, L"STATIC", L"就绪。输入关键词开始搜索。", 0, 0, 0, 0, 0, 0);
+        g_hStatus = Mk(h, L"STATIC", L"就绪。输入关键词开始搜索。", 0, IDC_ST_STATUS, 0, 0, 0, 0);
         ClearDetails();
 
         // 搜索框回车
         SetWindowLongPtrW(g_hSearch, GWLP_USERDATA,
                           (LONG_PTR)SetWindowLongPtrW(g_hSearch, GWLP_WNDPROC, (LONG_PTR)EditProc));
+
 
         // 从内存加载嵌入的 ICO 图标（单文件，无需外部 icon.ico）
         HICON hIcon = CreateIconFromResourceEx((PBYTE)ICON_DATA, (DWORD)ICON_SIZE,
@@ -866,15 +1141,63 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             SendMessageW(g_hMain, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
             SendMessageW(g_hMain, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
         }
+        { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "WM_CREATE icon ok\n"); fclose(f); } }
 
         // 启动即显示首页推荐
         ShowHome();
+        { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "WM_CREATE done\n"); fclose(f); } }
         return 0;
     }
     case WM_SIZE:
         Layout();
         return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        DrawChrome(dc);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)l;
+        if (!dis) return 0;
+        int id = dis->CtlID;
+        if (id == IDC_BTN_SEARCH || id == IDC_BTN_HOME ||
+            id == IDC_BTN_DETAILS || id == IDC_BTN_INSTALL) {
+            DrawGoogleButton(dis);
+            return TRUE;
+        }
+        if (id >= IDC_ST_PUB && id <= IDC_ST_HOME) {
+            DrawDetailRow(dis);
+            return TRUE;
+        }
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HWND hc = (HWND)l;
+        HDC dc = (HDC)w;
+        if (hc == g_hStatus) { SetBkMode(dc, TRANSPARENT); SetTextColor(dc, COL_TEXT2); return (LRESULT)g_brBg; }
+        if (hc == g_hDesc)   { SetTextColor(dc, COL_TEXT); SetBkColor(dc, COL_SURFACE); return (LRESULT)g_brWhite; }
+        SetBkMode(dc, TRANSPARENT);
+        if (hc == g_hGrp)     { SetTextColor(dc, COL_BLUE);  return (LRESULT)g_brWhite; }
+        if (hc == g_hStName)  { SetTextColor(dc, COL_TEXT);   return (LRESULT)g_brWhite; }
+        if (hc == g_hDescLbl) { SetTextColor(dc, COL_TEXT2);  return (LRESULT)g_brWhite; }
+        SetTextColor(dc, COL_TEXT2);
+        return (LRESULT)g_brWhite;
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)w;
+        SetTextColor(dc, COL_TEXT);
+        SetBkColor(dc, COL_SURFACE);
+        return (LRESULT)g_brWhite;
+    }
     case WM_COMMAND:
+        if (LOWORD(w) == IDC_EDIT_SEARCH &&
+            (HIWORD(w) == EN_SETFOCUS || HIWORD(w) == EN_KILLFOCUS)) {
+            g_searchFocus = (HIWORD(w) == EN_SETFOCUS);
+            InvalidateRect(g_hMain, &g_rcPill, TRUE);
+            return 0;
+        }
         switch (LOWORD(w)) {
         case IDC_BTN_SEARCH:  DoSearch(); break;
         case IDC_BTN_HOME:    ShowHome(); break;
@@ -929,6 +1252,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 // ---------------- 入口 ----------------
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show) {
+    { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "wWinMain start\n"); fclose(f); } }
     // 高 DPI
     {
         HMODULE u32 = GetModuleHandleW(L"user32.dll");
@@ -941,8 +1265,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show) {
             if (pSetAware) pSetAware();
         }
     }
+    { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "after dpi\n"); fclose(f); } }
     MY_INITCC icc = { sizeof(icc), ICC_LISTVIEW_CLASSES };
     InitCommonControlsEx(&icc);
+    { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "after icc\n"); fclose(f); } }
 
     WNDCLASSW wc;
     ZeroMemory(&wc, sizeof(wc));
@@ -952,6 +1278,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show) {
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = L"WingetStoreWnd";
     RegisterClassW(&wc);
+    { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "after regclass\n"); fclose(f); } }
 
     RECT rc = { 0, 0, 0, 0 };
     // 先以 96dpi 计算窗口大小，WM_CREATE 里拿到真实 dpi 后 WM_SIZE 会重排
@@ -963,8 +1290,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show) {
 
     HWND h = CreateWindowExW(0, L"WingetStoreWnd", APP_TITLE, WS_OVERLAPPEDWINDOW,
                              sx, sy, W, H, NULL, NULL, hInst, NULL);
+    { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "after create hwnd=%p\n", (void*)h); fclose(f); } }
     ShowWindow(h, show);
     UpdateWindow(h);
+    { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "after show\n"); fclose(f); } }
 
     // 系统版本自检：低于要求时提示（仍可打开界面，但 winget 可能不可用）
     {
@@ -988,5 +1317,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    { FILE *f = fopen("debug.txt", "a"); if (f) { fprintf(f, "msg loop exit\n"); fclose(f); } }
     return (int)msg.wParam;
 }
